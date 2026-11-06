@@ -167,7 +167,7 @@ GitHub answers 404 also when the agent lost access to a private repository, so a
 
 A notified Issue or pull request whose reads keep failing is dropped a day after its first failed read, and at once when GitHub reports it as deleted; it then no longer fails the poll, its Thread keeps the error, and the Source's state names it.
 
-Its read position stays where it was, so a later notification or a poll of its Thread reads what the failed reads missed.
+Its read position stays where it was, so a later notification or a poll of its Thread reads what the failed reads missed. A notification reads its Thread from that position, or from the Thread's opening when it has none, not from how far polling has come, so a mention made before the notification surfaced still arrives; comments older than the polling cursor arrive only when they address the agent.
 
 The Feishu event consumer reports every failure, and polling of subscribed topics keeps each failure on its Thread.
 

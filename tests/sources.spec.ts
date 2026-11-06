@@ -858,9 +858,46 @@ describe('github source', () => {
     await pollRound(h)
     const expected = commentTrigger(comment, { number: 12, isPr: false, url }, 'conversation', 'agent-bot')
     expect(h.receive.mock.calls.map(([trigger]) => trigger)).toEqual([expected])
-    // An Issue has only its conversation; the comments are read since the notification cursor.
-    const since = encodeURIComponent('2026-09-08T00:00:00.000Z')
+    // An Issue has only its conversation; a Thread with no read position yet is read from its opening, not from the
+    // polling cursor, which has usually passed comments made before its notification arrived.
+    const since = encodeURIComponent('2026-08-01T00:00:00.000Z')
     expect(reads.filter(path => path.includes('/comments'))).toEqual([`issues/12/comments?per_page=100&since=${since}`])
+    h.store.close()
+  })
+  it('brings a mention made before the poll that first reads its Issue, instead of a silent read with nothing', async () => {
+    const h = host()
+    // Issue #77's timeline: opened 07:15:14, mentioned 07:15:23, and only polled at 07:18:22, when `since` had already
+    // passed both. The mention must still reach the gate, and the read must say what it took in.
+    const url = 'https://github.com/acme/widgets/issues/12'
+    const mention: GithubComment = { id: 6679437964, body: '@agent-bot 请评估并修复', user: { login: 'alice', type: 'User' },
+      html_url: `${url}#issuecomment-6679437964`, created_at: '2026-11-06T07:15:23Z', updated_at: '2026-11-06T07:15:23Z' }
+    const { reads } = notify(h, [issue(12, { created_at: '2026-11-06T07:15:14Z' })], { 12: [mention] },
+      '2026-11-06T07:18:17.885Z')
+    await pollRound(h)
+    expect(h.receive.mock.calls.map(([trigger]) => trigger.text)).toEqual(['@agent-bot 请评估并修复'])
+    expect(h.receive.mock.calls[0]![0]).toMatchObject({ addressed: 'mention', threads: [{ source: 'github', id: '12' }] })
+    // The Issue was opened before the polling cursor, so its body is not brought: only the mention is.
+    expect(h.receive).toHaveBeenCalledTimes(1)
+    expect(reads.filter(path => path.includes('/comments'))).toEqual([`issues/12/comments?per_page=100&since=${encodeURIComponent('2026-11-06T07:15:14.000Z')}`])
+    // What the read took in becomes the Thread's position, so a later notification does not bring it again.
+    expect(h.store.get('github-cursor:12')).toBeDefined()
+    h.receive.mockClear()
+    notify(h, [issue(12, { created_at: '2026-11-06T07:15:14Z' })], { 12: [mention] }, '2026-11-06T07:19:37.000Z')
+    await pollRound(h)
+    expect(h.receive).not.toHaveBeenCalled()
+    h.store.close()
+  })
+  it('leaves discussion older than the polling cursor out when it addresses nobody', async () => {
+    const h = host()
+    // An older Issue whose only comment predates the polling cursor: nothing becomes a Trigger, and its read position
+    // starts at the opening rather than at the comment, which nothing read before this Source.
+    const plain: GithubComment = { id: 5, body: 'same here on Safari', user: { login: 'bob', type: 'User' },
+      html_url: 'https://github.com/acme/widgets/issues/12#issuecomment-5',
+      created_at: '2026-08-02T00:00:00Z', updated_at: '2026-08-02T00:00:00Z' }
+    const { reads } = notify(h, [issue(12, { created_at: '2026-08-01T00:00:00Z' })], { 12: [plain] })
+    await pollRound(h)
+    expect(h.receive).not.toHaveBeenCalled()
+    expect(reads.filter(path => path.includes('/comments'))).toEqual([`issues/12/comments?per_page=100&since=${encodeURIComponent('2026-08-01T00:00:00.000Z')}`])
     h.store.close()
   })
   it('keeps one body Trigger for an Issue that a later poll reads again', async () => {

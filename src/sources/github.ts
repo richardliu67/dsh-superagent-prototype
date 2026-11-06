@@ -320,7 +320,7 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
     const address = githubAddress(notification.subject.url ?? '', repository)
     if (!address || address.discussion || items.has(address.number)) continue
     const { number, pr } = address
-    items.set(number, { since: [state.get(KV.github.cursor(number)) ?? since, since].sort().at(-1)!, pr })
+    items.set(number, { since, pr })
   }
   for (const [number, item] of items) {
     if (stopped(ctx, round)) return { count: notifications.length, interval }
@@ -343,6 +343,11 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
 }
 async function readNotified(ctx: SourceContext, round: Round, number: number, item: Retry): Promise<void> {
   const { since } = item
+  // The Thread's own position — the newest item an earlier read covered, or the opening of a Thread never read — decides
+  // which comments its notification brings. `item.since`, the polling cursor, covers how far polling has come; using it
+  // as the read position dropped a mention whenever GitHub delivered its notification after polling had passed it, and
+  // then moved the position past it, so the loss was silent and permanent.
+  const position = ctx.state.get(KV.github.cursor(number))
   let isPr = item.pr
   if (!isPr) {
     const issue = await ctx.commands.withSignal(round.signal).api(IssueSchema, `issues/${number}`)
@@ -354,7 +359,7 @@ async function readNotified(ctx: SourceContext, round: Round, number: number, it
       const { login } = ctx.deployment.github
       const opened = Date.parse(issue.created_at) >= Date.parse(since) && !sameName(issue.user.login, login)
       if (opened) await ctx.receive(issueTrigger(issue, login))
-      await intakeComments(ctx, { number, isPr: false, url: issue.html_url }, since, round)
+      await intakeComments(ctx, { number, isPr: false, url: issue.html_url }, position ?? isoAt(issue.created_at), round, since)
       nameThread(ctx, number, issue.title)
     }
   }
@@ -366,12 +371,14 @@ async function readNotified(ctx: SourceContext, round: Round, number: number, it
       const opened = { number, title: pr.title ?? '', body: pr.body, user: pr.user, created_at: pr.created_at, html_url: pr.html_url }
       await ctx.receive(pullTrigger(opened, login))
     }
-    await intakeComments(ctx, { number, isPr: true, url: pr.html_url, prAuthor: pr.user.login }, since, round)
+    await intakeComments(ctx, { number, isPr: true, url: pr.html_url, prAuthor: pr.user.login }, position ?? (pr.created_at ? isoAt(pr.created_at) : since), round, since)
     if (pr.title) nameThread(ctx, number, pr.title)
   }
   ctx.state.set(KV.github.cursor(number), cursorAt(round.started))
   ctx.threads.patch(`github:${number}`, { pollError: undefined })
 }
+/** A GitHub timestamp in canonical ISO-8601, so a Thread's opening and the position a read leaves compare in time order. */
+const isoAt = (at: string): string => new Date(at).toISOString()
 /** Reads and observes a PR at most once per polling round. */
 function pull(ctx: SourceContext, round: Round, number: number): Promise<Pull> {
   let read = round.pulls.get(number)
@@ -381,7 +388,13 @@ function pull(ctx: SourceContext, round: Round, number: number): Promise<Pull> {
   }
   return read
 }
-async function intakeComments(ctx: SourceContext, ref: PullRef, since: string, round: Round): Promise<void> {
+/**
+ * Reads a Thread's conversation, reviews, and inline comments from `since` (its read position, or its opening for a Thread
+ * never read). `covered` is the polling cursor: a comment older than it arrives only when it addresses the agent, so a
+ * mention made before its notification surfaced still reaches the gate, while older discussion that addresses nobody is
+ * not replayed as Triggers.
+ */
+async function intakeComments(ctx: SourceContext, ref: PullRef, since: string, round: Round, covered?: string): Promise<void> {
   const commands = ctx.commands.withSignal(round.signal)
   const { login } = ctx.deployment.github
   const kinds = ref.isPr ? ['conversation', 'inline', 'review'] as const : ['conversation'] as const
@@ -397,7 +410,9 @@ async function intakeComments(ctx: SourceContext, ref: PullRef, since: string, r
       if (sameName(comment.user.login, login)) continue
       // A review decision without a body still reaches the ticket: a worker may be waiting for that approval.
       const trigger = commentTrigger(comment, ref, kind, login)
-      if (trigger.text) await ctx.receive(trigger)
+      if (!trigger.text) continue
+      if (covered !== undefined && timestamp < Date.parse(covered) && trigger.addressed !== 'mention') continue
+      await ctx.receive(trigger)
     }
   }
 }
